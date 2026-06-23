@@ -1,11 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// IMPORTANT : remplace "mine-calculator" ci-dessous par le nom EXACT
-// de ton dépôt GitHub si tu déploies sur GitHub Pages
-// (ex : https://github.com/tonpseudo/mine-calculator -> base: "/mine-calculator/")
-// Si tu déploies sur Vercel ou Netlify, laisse base: "/"
+// Le "base" doit correspondre EXACTEMENT au nom de ton dépôt GitHub.
+// Dépôt : https://github.com/lankoandeyoumani7-cyber/Small-Scale-Mine-Calculator
+// -> base: "/Small-Scale-Mine-Calculator/"
+// Si tu déploies sur Vercel ou Netlify à la place, mets base: "/"
 export default defineConfig({
   plugins: [react()],
-  base: "/mine-calculator/",
+  base: "/Small-Scale-Mine-Calculator/",
 });
