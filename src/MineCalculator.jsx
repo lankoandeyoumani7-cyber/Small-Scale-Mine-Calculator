@@ -136,7 +136,58 @@ function calcSensitivityGrid({ capacityTPD, oreDepth, recovery, permitAreaKm2, c
   return { goldPrices, grades, capacityLevels, baseCapacityIndex: 1 };
 }
 
-function computePhase(inputs) {
+// ─── INTER-PHASE CAPEX/OPEX LOGIC ─────────────────────────────────────────
+// Le materiel et le personnel sont mutualises entre phases (meme projet).
+// - Si la capacite demandee <= capacite de reference (max atteint avant) :
+//   pas de nouvel investissement materiel, juste un entretien/remise a
+//   niveau (10-15% du CAPEX initial de reference). Pas de frais reglementaire.
+// - Si la capacite demandee > capacite de reference : on paie seulement le
+//   delta de CAPEX (capacite totale - capacite de reference), l'OPEX est
+//   recalcule sur la nouvelle capacite totale, et un frais reglementaire
+//   fixe de modification du plan d'exploitation s'applique.
+const REFRESH_CAPEX_RATE = 0.125; // 12.5%, milieu de la fourchette 10-15%
+const PLAN_MODIFICATION_FEE_CFA = 10000000; // 10M FCFA, modification plan d'exploitation
+
+function computeInterPhaseCapex({ capacityTPD, depth, priorMaxCapacity, priorCapexTotal }) {
+  const isExtension = priorMaxCapacity != null && capacityTPD > priorMaxCapacity;
+  const isFirstPhase = priorMaxCapacity == null;
+
+  if (isFirstPhase) {
+    const capex = estimateCapex(capacityTPD, depth);
+    const capexTotal = Object.values(capex).reduce((a, b) => a + b, 0);
+    return { capex, capexTotal, mode: "initial", planModificationFeeUSD: 0 };
+  }
+
+  if (isExtension) {
+    // CAPEX du delta = CAPEX(nouvelle capacité totale) − CAPEX(capacité de référence)
+    const capexNew = estimateCapex(capacityTPD, depth);
+    const capexPrior = estimateCapex(priorMaxCapacity, depth);
+    const capex = {};
+    Object.keys(capexNew).forEach(k => {
+      capex[k] = Math.max(0, Math.round(capexNew[k] - (capexPrior[k] || 0)));
+    });
+    const capexTotal = Object.values(capex).reduce((a, b) => a + b, 0);
+    return {
+      capex, capexTotal, mode: "extension",
+      planModificationFeeUSD: PLAN_MODIFICATION_FEE_CFA / BF.cfaToUsd,
+    };
+  }
+
+  // Remise à niveau : capacité demandée <= capacité de référence
+  const refCapexTotal = priorCapexTotal != null ? priorCapexTotal : Object.values(estimateCapex(priorMaxCapacity, depth)).reduce((a, b) => a + b, 0);
+  const refreshTotal = Math.round(refCapexTotal * REFRESH_CAPEX_RATE);
+  // Répartition proportionnelle du montant d'entretien sur les mêmes postes que le CAPEX de référence, pour garder le détail informatif
+  const refCapex = estimateCapex(priorMaxCapacity, depth);
+  const refSum = Object.values(refCapex).reduce((a, b) => a + b, 0) || 1;
+  const capex = {};
+  Object.keys(refCapex).forEach(k => {
+    capex[k] = Math.round((refCapex[k] / refSum) * refreshTotal);
+  });
+  const capexTotal = Object.values(capex).reduce((a, b) => a + b, 0);
+  return { capex, capexTotal, mode: "refresh", planModificationFeeUSD: 0 };
+}
+
+function computePhase(inputs, priorContext) {
   const tonnes = parseFloat(inputs.tonnes) || 0;
   const grade = parseFloat(inputs.grade) || 0;
   const depth = parseFloat(inputs.depth) || 0;
@@ -146,20 +197,47 @@ function computePhase(inputs) {
   const goldPrice = parseFloat(inputs.goldPrice) || 0;
   const effectiveGold = inputs.useReservePrice ? goldPrice * BF.reservePriceFactor : goldPrice;
 
-  const capex = estimateCapex(capacityTPD, depth);
-  const capexTotal = Object.values(capex).reduce((a, b) => a + b, 0);
+  const priorMaxCapacity = priorContext ? priorContext.maxCapacity : null;
+  const priorCapexTotal = priorContext ? priorContext.maxCapacityCapexTotal : null;
+
+  const { capex, capexTotal, mode, planModificationFeeUSD } = computeInterPhaseCapex({
+    capacityTPD, depth, priorMaxCapacity, priorCapexTotal,
+  });
+
+  // OPEX toujours recalculé sur la nouvelle capacité totale (decision validee)
   const opex = estimateOpex(capacityTPD, 1);
   const cog = calcCutoffGrade(effectiveGold);
-  const fin = calcFinancials({ capexTotal, opexMonthly: opex.total, capacityTPD, grade, recovery, goldPriceUSD: effectiveGold, permitAreaKm2 });
+  const fin = calcFinancials({
+    capexTotal: capexTotal + planModificationFeeUSD,
+    opexMonthly: opex.total, capacityTPD, grade, recovery, goldPriceUSD: effectiveGold, permitAreaKm2,
+  });
   const sensitivity = calcSensitivityGrid({ capacityTPD, oreDepth: depth, recovery, permitAreaKm2, centerGoldPrice: effectiveGold, centerGrade: grade });
   const durationMonths = capacityTPD > 0 ? Math.ceil(tonnes / (capacityTPD * 30)) : 0;
 
-  return { tonnes, grade, depth, capacityTPD, recovery, permitAreaKm2, goldPrice, effectiveGold, useReservePrice: inputs.useReservePrice, capex, capexTotal, opex, cog, fin, sensitivity, durationMonths };
+  // Contexte transmis à la phase suivante :
+  // - maxCapacity : la plus grande capacité installée jusqu'ici (cette phase incluse)
+  // - maxCapacityCapexTotal : le CAPEX matériel (estimateCapex brut, sans le delta)
+  //   correspondant à cette capacité de référence, pour pouvoir recalculer
+  //   correctement le delta ou la remise à niveau à l'étape suivante.
+  const maxCapacityAfter = Math.max(capacityTPD, priorMaxCapacity || 0);
+  const maxCapacityCapexTotalAfter = capacityTPD >= (priorMaxCapacity || 0)
+    ? Object.values(estimateCapex(capacityTPD, depth)).reduce((a, b) => a + b, 0)
+    : priorCapexTotal;
+
+  return {
+    tonnes, grade, depth, capacityTPD, recovery, permitAreaKm2, goldPrice, effectiveGold,
+    useReservePrice: inputs.useReservePrice, capex, capexTotal, planModificationFeeUSD,
+    capexGrandTotal: capexTotal + planModificationFeeUSD,
+    interPhaseMode: mode, opex, cog, fin, sensitivity, durationMonths,
+    maxCapacityAfter, maxCapacityCapexTotalAfter,
+  };
 }
 
 function isPhaseFilled(inputs) {
   return inputs.tonnes && inputs.grade && inputs.capacityTPD && inputs.recovery && inputs.permitAreaKm2 && inputs.goldPrice;
 }
+
+
 
 const fmt = (n, dec = 0) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString("fr-FR", { minimumFractionDigits: dec, maximumFractionDigits: dec });
 const fmtUSD = (n) => `$${fmt(n)}`;
@@ -338,7 +416,7 @@ async function generatePdfReport({ phases, consolidated }) {
   ]);
 
   phases.forEach((p) => {
-    const { capex, capexTotal, opex, cog, fin, sensitivity, durationMonths } = p.results;
+    const { capex, capexTotal, capexGrandTotal, planModificationFeeUSD, interPhaseMode, opex, cog, fin, sensitivity, durationMonths } = p.results;
     doc.addPage(); y = 56;
     const titleColor = p.color === C.red ? colors.red : p.color === C.gold ? colors.gold : colors.success;
     sectionTitle(`${p.label}${p.depositName ? " - " + p.depositName : ""}`, titleColor);
@@ -352,7 +430,7 @@ async function generatePdfReport({ phases, consolidated }) {
 
     y += 6;
     kpiGrid([
-      { label: "CAPEX", value: fmtK(capexTotal), color: colors.red },
+      { label: "CAPEX (phase)", value: fmtK(capexGrandTotal), color: colors.red },
       { label: "OPEX / mois", value: fmtK(opex.total), color: colors.earth },
       { label: "VAN (Base)", value: fmtK(fin.van), color: fin.van > 0 ? colors.success : colors.red },
       { label: "VAN (Conservateur)", value: fmtK(fin.vanConserv), color: fin.vanConserv > 0 ? colors.success : colors.red },
@@ -363,7 +441,16 @@ async function generatePdfReport({ phases, consolidated }) {
     row("Teneur de coupure calculee", `${cog.cog} g/t`);
     row("Teneur de coupure retenue (prudente)", `${cog.recommended} g/t`);
 
-    sectionTitle("CAPEX Detaille", colors.red);
+    const capexSectionTitle = interPhaseMode === "initial" ? "CAPEX Detaille" : interPhaseMode === "extension" ? "CAPEX Detaille - Extension de Capacite (Delta)" : "CAPEX Detaille - Entretien / Remise a Niveau";
+    sectionTitle(capexSectionTitle, colors.red);
+    if (interPhaseMode !== "initial") {
+      paragraph(
+        interPhaseMode === "extension"
+          ? "Cette phase augmente la capacite par rapport au materiel deja installe dans les phases precedentes. Seul le surplus (delta) est facture ci-dessous."
+          : "Cette phase utilise une capacite egale ou inferieure au materiel deja installe. Seul un entretien/remise a niveau (~12,5% du CAPEX de reference) est facture.",
+        8, colors.muted
+      );
+    }
     [
       ["Mine (engins + camions)", capex.mine], ["Concassage", capex.crushing],
       ["Broyage", capex.grinding], ["Lixiviation CIL", capex.cil],
@@ -373,7 +460,11 @@ async function generatePdfReport({ phases, consolidated }) {
       ["EPI / Securite", capex.ppe], ["Permis d'exploitation", capex.permis],
       ["NIES (estimation)", capex.nies],
     ].forEach(([l, v]) => row(l, fmtUSD(v)));
-    totalRow("TOTAL CAPEX", fmtUSD(capexTotal), colors.red);
+    totalRow("Sous-total CAPEX materiel", fmtUSD(capexTotal), colors.red);
+    if (planModificationFeeUSD > 0) {
+      row("Frais de modification du plan d'exploitation (loi)", fmtUSD(Math.round(planModificationFeeUSD)), "10 000 000 FCFA - extension de capacite");
+    }
+    totalRow("TOTAL CAPEX (phase)", fmtUSD(capexGrandTotal), colors.red);
 
     sectionTitle("OPEX Mensuel Detaille", colors.earth);
     [
@@ -514,14 +605,14 @@ function PhaseForm({ phaseLabel, inputs, onChange }) {
 }
 
 function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
-  const { capex, capexTotal, opex, cog, fin, sensitivity, durationMonths, tonnes, grade, recovery, capacityTPD, effectiveGold, useReservePrice, permitAreaKm2 } = results;
+  const { capex, capexTotal, capexGrandTotal, planModificationFeeUSD, interPhaseMode, opex, cog, fin, sensitivity, durationMonths, tonnes, grade, recovery, capacityTPD, effectiveGold, useReservePrice, permitAreaKm2 } = results;
   const maxVan = Math.max(Math.abs(fin.van), Math.abs(fin.vanConserv));
 
   return (
     <div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
         {[
-          { label: "CAPEX Total", value: fmtK(capexTotal), color: C.red },
+          { label: "CAPEX Total", value: fmtK(capexGrandTotal), color: C.red },
           { label: "OPEX Mensuel", value: fmtK(opex.total), color: C.earth },
           { label: "VAN (Base)", value: fmtK(fin.van), color: fin.van > 0 ? C.success : C.red },
           { label: "VAN (Conservateur)", value: fmtK(fin.vanConserv), color: fin.vanConserv > 0 ? C.success : C.red },
@@ -559,7 +650,18 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
         <MetricRow label="Duree d'exploitation estimee" value={`${durationMonths} mois`} sub={`Base: ${fmt(capacityTPD)} t/j`} />
       </Card>
 
-      <Card title="Couts d'Investissement (CAPEX)" accent={C.red}>
+      <Card title={interPhaseMode === "initial" ? "Couts d'Investissement (CAPEX)" : interPhaseMode === "extension" ? "Couts d'Investissement — Extension de Capacite (CAPEX du Delta)" : "Couts d'Investissement — Entretien / Remise a Niveau"} accent={C.red}>
+        {interPhaseMode !== "initial" && (
+          <div style={{
+            marginBottom: 14, padding: 10, borderRadius: 8, fontSize: 12,
+            background: interPhaseMode === "extension" ? C.warnBg : C.successBg,
+            color: interPhaseMode === "extension" ? C.warn : C.success,
+          }}>
+            {interPhaseMode === "extension"
+              ? "Cette phase augmente la capacite par rapport au materiel deja installe. Seul le surplus (delta) est facture ci-dessous ; l'equipement existant n'est pas repaye."
+              : "Cette phase utilise une capacite egale ou inferieure au materiel deja installe. Seul un entretien/remise a niveau (~12,5% du CAPEX de reference) est facture."}
+          </div>
+        )}
         {[
           ["Mine (engins + camions)", capex.mine], ["Concassage", capex.crushing],
           ["Broyage", capex.grinding], ["Lixiviation CIL", capex.cil],
@@ -569,7 +671,16 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
           ["EPI / Securite", capex.ppe], ["Permis d'exploitation (octroi)", capex.permis],
           ["NIES (estimation)", capex.nies],
         ].map(([l, v]) => <MetricRow key={l} label={l} value={fmtUSD(v)} />)}
-        <MetricRow label="TOTAL CAPEX" value={fmtUSD(capexTotal)} highlight={C.red} />
+        <MetricRow label="Sous-total CAPEX materiel" value={fmtUSD(capexTotal)} highlight={C.red} />
+        {planModificationFeeUSD > 0 && (
+          <MetricRow
+            label="Frais de modification du plan d'exploitation (loi)"
+            value={fmtUSD(Math.round(planModificationFeeUSD))}
+            sub="10 000 000 FCFA — exige par la loi en cas d'extension de capacite"
+            highlight={C.warn}
+          />
+        )}
+        <MetricRow label="TOTAL CAPEX (phase)" value={fmtUSD(capexGrandTotal)} highlight={C.red} />
       </Card>
 
       <Card title="Couts d'Exploitation Mensuels (OPEX)" accent={C.earth}>
@@ -615,7 +726,7 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
           </div>
         )}
         <div style={{ marginTop: 12, fontSize: 12, color: C.textMuted }}>
-          Flux nets incluent les redevances, FMD et taxes superficieres. CAPEX initial = {fmtK(capexTotal)}.
+          Flux nets incluent les redevances, FMD et taxes superficieres. CAPEX pris en compte = {fmtK(capexGrandTotal)}.
         </div>
       </Card>
 
@@ -684,15 +795,28 @@ export default function MineCalculator() {
 
   const updatePhaseInput = (idx, newInputs) => setPhaseInputs(prev => prev.map((p, i) => i === idx ? newInputs : p));
 
-  const phaseResultsList = useMemo(
-    () => phaseInputs.map((inp, idx) => showResults[idx] && isPhaseFilled(inp) ? computePhase(inp) : null),
-    [phaseInputs, showResults]
-  );
+  const phaseResultsList = useMemo(() => {
+    const results = [];
+    let priorContext = null; // { maxCapacity, maxCapacityCapexTotal }
+    for (let idx = 0; idx < phaseInputs.length; idx++) {
+      const inp = phaseInputs[idx];
+      if (showResults[idx] && isPhaseFilled(inp)) {
+        const r = computePhase(inp, priorContext);
+        results.push(r);
+        priorContext = { maxCapacity: r.maxCapacityAfter, maxCapacityCapexTotal: r.maxCapacityCapexTotalAfter };
+      } else {
+        results.push(null);
+        // Une phase non calculée ne casse pas la chaîne : on garde le
+        // contexte précédent tel quel pour la phase suivante si elle existe.
+      }
+    }
+    return results;
+  }, [phaseInputs, showResults]);
 
   const consolidated = useMemo(() => {
     const filled = phaseResultsList.filter(Boolean);
     return {
-      capexTotal: filled.reduce((a, r) => a + r.capexTotal, 0),
+      capexTotal: filled.reduce((a, r) => a + r.capexGrandTotal, 0),
       opexTotal: filled.reduce((a, r) => a + r.opex.total, 0),
       vanTotal: filled.reduce((a, r) => a + r.fin.van, 0),
       vanConservTotal: filled.reduce((a, r) => a + r.fin.vanConserv, 0),
