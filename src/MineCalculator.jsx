@@ -13,7 +13,8 @@ const BF = {
   redevanceRate: 0.08, fmdRate: 0.01,
   taxeSuperfY1: 1500000 / 565.5, taxeSuperfRenew: 3000000 / 565.5,
   permisOctroi: 7000000 / 565.5, discountRate: 0.10,
-  reservePriceFactor: 0.778, cfaToUsd: 565.5, ozToG: 31.1035,
+  isRate: 0.275, // Impot sur les benefices 27,5%
+  cfaToUsd: 565.5, ozToG: 31.1035,
   miningCostPerTonne: 26, processingCostPerTonne: 38.5, sustainCapCostPerTonne: 5.5,
 };
 
@@ -25,7 +26,8 @@ const PHASE_DEFS = [
 
 const emptyPhaseInputs = () => ({
   depositName: "", tonnes: "", grade: "", depth: "", oreType: "oxide",
-  capacityTPD: "", recovery: "", permitAreaKm2: "", goldPrice: "", useReservePrice: true,
+  capacityTPD: "", recovery: "", permitAreaKm2: "", goldPrice: "",
+  useReservePrice: true, reserveDiscount: null, // null = pas encore calculé/choisi
 });
 
 function estimateCapex(capacityTPD, pitDepth) {
@@ -70,36 +72,65 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
   const monthlyOre = capacityTPD * 30;
   const goldRecoveredMonthly = monthlyOre * grade * recovery;
   const revenueMonthly = goldRecoveredMonthly * goldPerG;
-  const redevance = revenueMonthly * BF.redevanceRate;
-  const fmd = revenueMonthly * BF.fmdRate;
-  const taxeY1 = BF.taxeSuperfY1 * permitAreaKm2;
-  const taxeRenew = BF.taxeSuperfRenew * permitAreaKm2;
+  const revenueAnnual = revenueMonthly * 12;
+
+  // Etape 1 : Benefice mensuel brut = CA - OPEX
   const cashflowBrut = revenueMonthly - opexMonthly;
-  const cashflowNetY1 = (cashflowBrut - redevance - fmd - taxeY1 / 12) * 12;
-  const cashflowNetY2 = (cashflowBrut - redevance - fmd - taxeRenew / 12) * 12;
+
+  // Etape 2 : Flux de tresorerie BRUT annuel apres IS 27,5%
+  // (Benefice mensuel x 12) x 0,725 = Flux brut annuel apres IS
+  // C'est le "FLUX DE TRESORERIE BRUT" du Tableau 15
+  const isMultiplier = 1 - BF.isRate; // 0.725
+  const fluxBrutAnnuelApresIS = cashflowBrut * 12 * isMultiplier;
+
+  // Etape 3 : Deductions sur le CA annuel (redevances, FMD, taxes superficieres)
+  // Ces deductions s'appliquent SUR LE FLUX BRUT APRES IS pour donner le flux NET
+  const redevanceAnnuelle = revenueAnnual * BF.redevanceRate;  // 8% du CA annuel
+  const fmdAnnuel = revenueAnnual * BF.fmdRate;                // 1% du CA annuel
+  const taxeY1 = BF.taxeSuperfY1 * permitAreaKm2;             // Taxes superficieres A1
+  const taxeRenew = BF.taxeSuperfRenew * permitAreaKm2;       // Taxes superficieres A2+
+
+  const totalDeductionsY1 = redevanceAnnuelle + fmdAnnuel + taxeY1;
+  const totalDeductionsY2 = redevanceAnnuelle + fmdAnnuel + taxeRenew;
+
+  // Etape 4 : FLUX DE TRESORERIE NET = Flux brut apres IS - Total deductions
+  // C'est ce flux qui entre dans la VAN (comme dans le Tableau 15)
+  const cashflowNetY1 = fluxBrutAnnuelApresIS - totalDeductionsY1;
+  const cashflowNetY2 = fluxBrutAnnuelApresIS - totalDeductionsY2;
+
   const cf = [cashflowNetY1, cashflowNetY2, cashflowNetY2];
   const van = cf.reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 1), -capexTotal);
 
+  // Scenario conservateur (-50% prix or), meme sequence
   const goldPriceConserv = goldPriceUSD * 0.5;
   const goldPerGConserv = goldPriceConserv / BF.ozToG;
   const revenueConserv = goldRecoveredMonthly * goldPerGConserv;
-  const redevConserv = revenueConserv * BF.redevanceRate;
-  const fmdConserv = revenueConserv * BF.fmdRate;
+  const revenueAnnualConserv = revenueConserv * 12;
   const cashBrutConserv = revenueConserv - opexMonthly;
-  const cfNetConservY1 = (cashBrutConserv - redevConserv - fmdConserv - taxeY1 / 12) * 12;
-  const cfNetConservY2 = (cashBrutConserv - redevConserv - fmdConserv - taxeRenew / 12) * 12;
+  const fluxBrutConservApresIS = cashBrutConserv * 12 * isMultiplier;
+  const redevConservAnnuelle = revenueAnnualConserv * BF.redevanceRate;
+  const fmdConservAnnuel = revenueAnnualConserv * BF.fmdRate;
+  const cfNetConservY1 = fluxBrutConservApresIS - (redevConservAnnuelle + fmdConservAnnuel + taxeY1);
+  const cfNetConservY2 = fluxBrutConservApresIS - (redevConservAnnuelle + fmdConservAnnuel + taxeRenew);
   const vanConserv = [cfNetConservY1, cfNetConservY2, cfNetConservY2].reduce(
     (acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 1), -capexTotal
   );
 
-  const paybackMonths = revenueMonthly > opexMonthly
-    ? Math.ceil(capexTotal / (cashflowBrut * 12) * 12)
+  const paybackMonths = cashflowNetY1 > 0
+    ? Math.ceil(capexTotal / cashflowNetY1 * 12)
     : null;
 
   return {
-    goldPerG, monthlyOre, goldRecoveredMonthly, revenueMonthly, redevance, fmd,
-    cashflowBrut, cashflowNetY1, cashflowNetY2, van, vanConserv, paybackMonths,
-    revenueAnnual: revenueMonthly * 12,
+    goldPerG, monthlyOre, goldRecoveredMonthly,
+    revenueMonthly, revenueAnnual,
+    cashflowBrut,
+    fluxBrutAnnuelApresIS,
+    isAnnuel: cashflowBrut * 12 * BF.isRate,
+    redevanceAnnuelle, fmdAnnuel,
+    taxeY1, taxeRenew,
+    totalDeductionsY1, totalDeductionsY2,
+    cashflowNetY1, cashflowNetY2,
+    van, vanConserv, paybackMonths,
     costPerTonne: opexMonthly / monthlyOre,
     marginPerTonne: (revenueMonthly - opexMonthly) / monthlyOre,
   };
@@ -110,6 +141,28 @@ function calcCutoffGrade(goldPriceUSD) {
   const goldPerG = goldPriceUSD / BF.ozToG;
   const cog = totalCostPerTonne / goldPerG;
   return { cog: Math.ceil(cog * 100) / 100, recommended: Math.ceil(cog * 100 + 5) / 100, totalCostPerTonne };
+}
+
+// ─── PRIX DE RESERVE PARAMETRABLE ─────────────────────────────────────────
+// Pour un prix spot donné, on cherche tous les multiples de 100 USD/oz
+// dont la décote par rapport au spot est comprise entre 20% et 30%.
+// Cela donne des prix ronds faciles à communiquer aux investisseurs.
+function calcReservePriceOptions(goldSpotUSD) {
+  if (!goldSpotUSD || goldSpotUSD <= 0) return [];
+  const options = [];
+  // On cherche les multiples de 100 dans la plage [spot*0.70 , spot*0.80]
+  const minPrice = goldSpotUSD * 0.70; // décote max 30%
+  const maxPrice = goldSpotUSD * 0.80; // décote min 20%
+  const startMultiple = Math.ceil(minPrice / 100) * 100;
+  for (let p = startMultiple; p <= maxPrice; p += 100) {
+    const discount = ((goldSpotUSD - p) / goldSpotUSD) * 100;
+    options.push({
+      reservePrice: p,
+      discount: Math.round(discount * 10) / 10, // arrondi à 0.1%
+      factor: p / goldSpotUSD,
+    });
+  }
+  return options;
 }
 
 function calcSensitivityGrid({ capacityTPD, oreDepth, recovery, permitAreaKm2, centerGoldPrice, centerGrade }) {
@@ -195,7 +248,12 @@ function computePhase(inputs, priorContext) {
   const recovery = (parseFloat(inputs.recovery) || 0) / 100;
   const permitAreaKm2 = parseFloat(inputs.permitAreaKm2) || 0;
   const goldPrice = parseFloat(inputs.goldPrice) || 0;
-  const effectiveGold = inputs.useReservePrice ? goldPrice * BF.reservePriceFactor : goldPrice;
+  // Prix effectif : si useReservePrice et qu'un discount a été choisi, on l'applique.
+  // Sinon on utilise le cours spot directement.
+  const chosenFactor = inputs.useReservePrice && inputs.reserveDiscount != null
+    ? 1 - inputs.reserveDiscount / 100
+    : 1;
+  const effectiveGold = goldPrice * chosenFactor;
 
   const priorMaxCapacity = priorContext ? priorContext.maxCapacity : null;
   const priorCapexTotal = priorContext ? priorContext.maxCapacityCapexTotal : null;
@@ -474,11 +532,23 @@ async function generatePdfReport({ phases, consolidated }) {
     ].forEach(([l, v]) => row(l, fmtUSD(v)));
     totalRow("TOTAL OPEX / mois", fmtUSD(opex.total), colors.earth);
 
-    sectionTitle("Revenus & VAN", colors.success);
-    row("Chiffre d'affaires mensuel", fmtUSD(Math.round(fin.revenueMonthly)));
-    row("Benefice brut mensuel", fmtUSD(Math.round(fin.cashflowBrut)));
-    row("VAN scenario de base", fmtK(fin.van));
-    row("VAN scenario conservateur (-50% prix or)", fmtK(fin.vanConserv));
+    sectionTitle("Calcul des Flux de Tresorerie Nets", colors.success);
+    row("CA mensuel", fmtUSD(Math.round(fin.revenueMonthly)));
+    row("OPEX mensuel", `(${fmtUSD(opex.total)})`);
+    row("Benefice mensuel brut (CA - OPEX)", fmtUSD(Math.round(fin.cashflowBrut)));
+    row("Benefice annuel brut (x12)", fmtUSD(Math.round(fin.cashflowBrut * 12)));
+    row("IS 27,5%", `(${fmtUSD(Math.round(fin.isAnnuel))})`);
+    totalRow("FLUX DE TRESORERIE BRUT annuel apres IS", fmtUSD(Math.round(fin.fluxBrutAnnuelApresIS)), colors.earth);
+    row("Redevance (8% du CA annuel)", `(${fmtUSD(Math.round(fin.redevanceAnnuelle))})`);
+    row("Fonds Minier de Developpement (1%)", `(${fmtUSD(Math.round(fin.fmdAnnuel))})`);
+    row("Taxes superficieres A1", `(${fmtUSD(Math.round(fin.taxeY1))})`);
+    totalRow("Total deductions A1", `(${fmtUSD(Math.round(fin.totalDeductionsY1))})`, colors.red);
+    row("Taxes superficieres A2+", `(${fmtUSD(Math.round(fin.taxeRenew))})`);
+    totalRow("Total deductions A2+", `(${fmtUSD(Math.round(fin.totalDeductionsY2))})`, colors.red);
+    totalRow("FLUX NET annuel A1", fmtUSD(Math.round(fin.cashflowNetY1)), colors.success);
+    totalRow("FLUX NET annuel A2 et A3", fmtUSD(Math.round(fin.cashflowNetY2)), colors.success);
+    row(`VAN scenario de base (IS 27,5%)`, fmtK(fin.van));
+    row(`VAN scenario conservateur (-50% prix or)`, fmtK(fin.vanConserv));
     if (fin.paybackMonths) row("Periode de remboursement estimee", `${fin.paybackMonths} mois`);
 
     y += 8;
@@ -588,16 +658,56 @@ function PhaseForm({ phaseLabel, inputs, onChange }) {
 
       <SectionTitle n="C">Prix de l'Or - {phaseLabel}</SectionTitle>
       <Card>
-        <Input label="Cours spot de l'or (marche)" value={inputs.goldPrice} onChange={v => onChange({ ...inputs, goldPrice: v })} unit="USD/oz" placeholder="Ex : 4500" />
-        <div style={{ display: "flex", alignItems: "flex-start", gap: 12, background: inputs.useReservePrice ? C.warnBg : C.panel, border: `1px solid ${inputs.useReservePrice ? C.warn + "44" : C.border}`, borderRadius: 8, padding: 14, cursor: "pointer" }}
-          onClick={() => onChange({ ...inputs, useReservePrice: !inputs.useReservePrice })}>
-          <div style={{ width: 18, height: 18, borderRadius: 4, border: `2px solid ${C.gold}`, background: inputs.useReservePrice ? C.gold : "transparent", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            {inputs.useReservePrice && <span style={{ color: "#fff", fontSize: 12, fontWeight: 900 }}>OK</span>}
+        <Input
+          label="Cours spot de l'or (marche)"
+          value={inputs.goldPrice}
+          onChange={v => onChange({ ...inputs, goldPrice: v, reserveDiscount: null })}
+          unit="USD/oz" placeholder="Ex : 4500"
+        />
+        <div style={{ marginBottom: 16 }}>
+          <Label>Methode de valorisation</Label>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <button onClick={() => onChange({ ...inputs, useReservePrice: false, reserveDiscount: null })}
+              style={{ flex: 1, padding: "8px", borderRadius: 6, fontFamily: "inherit", fontSize: 12, fontWeight: 700, cursor: "pointer", background: !inputs.useReservePrice ? C.earth : C.panel, color: !inputs.useReservePrice ? "#fff" : C.textMuted, border: `1.5px solid ${!inputs.useReservePrice ? C.earth : C.border}` }}>
+              Cours spot direct
+            </button>
+            <button onClick={() => onChange({ ...inputs, useReservePrice: true })}
+              style={{ flex: 1, padding: "8px", borderRadius: 6, fontFamily: "inherit", fontSize: 12, fontWeight: 700, cursor: "pointer", background: inputs.useReservePrice ? C.goldDark : C.panel, color: inputs.useReservePrice ? "#fff" : C.textMuted, border: `1.5px solid ${inputs.useReservePrice ? C.goldDark : C.border}` }}>
+              Prix de reserve (-20% a -30%)
+            </button>
           </div>
-          <div>
-            <div style={{ fontSize: 13, fontWeight: 700, color: C.earth, marginBottom: 2 }}>Appliquer la methode du prix de reserve (-22,2%)</div>
-            <div style={{ fontSize: 12, color: C.textMuted }}>Recommande pour stress-test et classification des ressources</div>
-          </div>
+          {inputs.useReservePrice && (() => {
+            const spot = parseFloat(inputs.goldPrice) || 0;
+            const options = calcReservePriceOptions(spot);
+            if (spot === 0) return <p style={{ fontSize: 12, color: C.textMuted, margin: 0 }}>Entrez d'abord le cours spot ci-dessus.</p>;
+            if (options.length === 0) return (
+              <div style={{ padding: 10, background: C.warnBg, borderRadius: 8, fontSize: 12, color: C.warn }}>
+                Aucun prix rond (multiple de 100 USD) ne tombe dans la plage -20% a -30% pour ce cours spot.
+              </div>
+            );
+            return (
+              <div>
+                <p style={{ fontSize: 12, color: C.textMuted, margin: "0 0 10px" }}>Choisissez le prix de reserve (multiple de 100 USD, decote entre 20% et 30%) :</p>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {options.map(opt => {
+                    const isSelected = inputs.reserveDiscount === opt.discount;
+                    return (
+                      <button key={opt.reservePrice} onClick={() => onChange({ ...inputs, reserveDiscount: opt.discount })}
+                        style={{ padding: "10px 14px", borderRadius: 8, fontFamily: "inherit", cursor: "pointer", background: isSelected ? C.goldDark : C.panel, color: isSelected ? "#fff" : C.text, border: `2px solid ${isSelected ? C.goldDark : C.border}`, textAlign: "center" }}>
+                        <div style={{ fontSize: 15, fontWeight: 900 }}>{opt.reservePrice.toLocaleString("fr-FR")} $</div>
+                        <div style={{ fontSize: 10, opacity: 0.8, marginTop: 2 }}>-{opt.discount}% du spot</div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {inputs.reserveDiscount != null && (
+                  <div style={{ marginTop: 10, padding: 10, background: C.warnBg, borderRadius: 8, fontSize: 12, color: C.goldDark, fontWeight: 700 }}>
+                    Prix retenu : {(spot * (1 - inputs.reserveDiscount / 100)).toLocaleString("fr-FR")} USD/oz ({inputs.reserveDiscount}% de decote)
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       </Card>
     </div>
@@ -605,7 +715,8 @@ function PhaseForm({ phaseLabel, inputs, onChange }) {
 }
 
 function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
-  const { capex, capexTotal, capexGrandTotal, planModificationFeeUSD, interPhaseMode, opex, cog, fin, sensitivity, durationMonths, tonnes, grade, recovery, capacityTPD, effectiveGold, useReservePrice, permitAreaKm2 } = results;
+  const { capex, capexTotal, capexGrandTotal, planModificationFeeUSD, interPhaseMode, opex, cog, fin, sensitivity, durationMonths, tonnes, grade, recovery, capacityTPD, effectiveGold, useReservePrice, reserveDiscount, permitAreaKm2 } = results;
+  const reserveLabel = useReservePrice && reserveDiscount != null ? `-${reserveDiscount}% du spot` : "cours spot direct";
   const maxVan = Math.max(Math.abs(fin.van), Math.abs(fin.vanConserv));
 
   return (
@@ -638,7 +749,7 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
           ))}
         </div>
         <p style={{ margin: 0, fontSize: 12, color: C.textMuted }}>
-          Prix de reserve utilise : <strong>{fmtUSD(Math.round(effectiveGold))} USD/oz</strong> ({useReservePrice ? "-22,2% du cours spot" : "cours spot direct"})
+          Prix de reserve utilise : <strong>{fmtUSD(Math.round(effectiveGold))} USD/oz</strong> ({reserveLabel})
         </p>
       </Card>
 
@@ -694,12 +805,33 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
         <MetricRow label="Cout de production unitaire" value={`${fin.costPerTonne.toFixed(1)} USD/t`} />
       </Card>
 
-      <Card title="Revenus & Marges Mensuels" accent={C.success}>
-        <MetricRow label="Prix de l'or utilise" value={`${fmtUSD(Math.round(effectiveGold))}/oz`} sub={useReservePrice ? "Prix de reserve (-22,2%)" : "Cours spot"} />
-        <MetricRow label="Or recupere/mois" value={`${fmt(fin.goldRecoveredMonthly, 0)} g`} sub={`${fmt(fin.goldRecoveredMonthly / BF.ozToG, 1)} oz`} />
-        <MetricRow label="Chiffre d'affaires mensuel" value={fmtUSD(Math.round(fin.revenueMonthly))} />
+      <Card title="Calcul des Flux de Tresorerie Nets (Tableau 15)" accent={C.success}>
+        <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 12, fontStyle: "italic" }}>
+          Sequence : Benefice mensuel → IS 27,5% → Flux brut annuel → Deductions (redevances, FMD, taxes) → Flux NET → VAN
+        </div>
+        <MetricRow label="CA mensuel" value={fmtUSD(Math.round(fin.revenueMonthly))} />
         <MetricRow label="OPEX mensuel" value={`(${fmtUSD(opex.total)})`} />
-        <MetricRow label="Benefice brut mensuel" value={fmtUSD(Math.round(fin.cashflowBrut))} highlight={fin.cashflowBrut > 0 ? C.success : C.red} />
+        <MetricRow label="Benefice mensuel brut (CA - OPEX)" value={fmtUSD(Math.round(fin.cashflowBrut))} highlight={fin.cashflowBrut > 0 ? C.success : C.red} />
+        <div style={{ margin: "10px 0 4px", fontSize: 11, fontWeight: 700, color: C.earth, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          Flux de tresorerie brut annuel (apres IS 27,5%)
+        </div>
+        <MetricRow label="Benefice annuel brut (x12)" value={fmtUSD(Math.round(fin.cashflowBrut * 12))} />
+        <MetricRow label="IS 27,5%" value={`(${fmtUSD(Math.round(fin.isAnnuel))})`} highlight={C.red} />
+        <MetricRow label="FLUX DE TRESORERIE BRUT annuel apres IS" value={fmtUSD(Math.round(fin.fluxBrutAnnuelApresIS))} highlight={C.earth} />
+        <div style={{ margin: "10px 0 4px", fontSize: 11, fontWeight: 700, color: C.earth, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          Deductions sur CA annuel
+        </div>
+        <MetricRow label={`Redevance (8% x CA annuel ${fmtUSD(Math.round(fin.revenueAnnual))})`} value={`(${fmtUSD(Math.round(fin.redevanceAnnuelle))})`} />
+        <MetricRow label="Fonds Minier de Developpement (1% CA)" value={`(${fmtUSD(Math.round(fin.fmdAnnuel))})`} />
+        <MetricRow label="Taxes superficieres A1" value={`(${fmtUSD(Math.round(fin.taxeY1))})`} />
+        <MetricRow label="Total deductions A1" value={`(${fmtUSD(Math.round(fin.totalDeductionsY1))})`} highlight={C.red} />
+        <MetricRow label="Taxes superficieres A2+" value={`(${fmtUSD(Math.round(fin.taxeRenew))})`} />
+        <MetricRow label="Total deductions A2+" value={`(${fmtUSD(Math.round(fin.totalDeductionsY2))})`} highlight={C.red} />
+        <div style={{ margin: "10px 0 4px", fontSize: 11, fontWeight: 700, color: C.success, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          Flux de tresorerie NET
+        </div>
+        <MetricRow label="FLUX NET annuel A1" value={fmtUSD(Math.round(fin.cashflowNetY1))} highlight={C.success} />
+        <MetricRow label="FLUX NET annuel A2 et A3" value={fmtUSD(Math.round(fin.cashflowNetY2))} highlight={C.success} />
         <MetricRow label="Valeur par tonne de minerai" value={`${fin.marginPerTonne.toFixed(1)} USD/t`} highlight={fin.marginPerTonne > 0 ? C.success : C.red} />
       </Card>
 
@@ -717,8 +849,8 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
       </Card>
 
       <Card title="Valeur Actuelle Nette - 3 ans (taux 10%)" accent={C.goldDark}>
-        <VanBar label={`Scenario base (${fmtUSD(Math.round(effectiveGold))}/oz)`} van={fin.van} maxAbs={maxVan} />
-        <VanBar label={`Scenario conservateur (${fmtUSD(Math.round(effectiveGold * 0.5))}/oz - -50%)`} van={fin.vanConserv} maxAbs={maxVan} />
+        <VanBar label={`Scenario base (${fmtUSD(Math.round(effectiveGold))}/oz, IS 27,5%)`} van={fin.van} maxAbs={maxVan} />
+        <VanBar label={`Scenario conservateur (-50% prix or, IS 27,5%)`} van={fin.vanConserv} maxAbs={maxVan} />
         {fin.paybackMonths && (
           <div style={{ marginTop: 16, padding: 12, background: C.successBg, borderRadius: 8, textAlign: "center" }}>
             <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 2 }}>Periode de remboursement estimee</div>
