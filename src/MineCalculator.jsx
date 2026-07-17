@@ -71,50 +71,56 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
   const goldPerG = goldPriceUSD / BF.ozToG;
   const monthlyOre = capacityTPD * 30;
   const goldRecoveredMonthly = monthlyOre * grade * recovery;
-  const revenueMonthly = goldRecoveredMonthly * goldPerG;
+
+  // CA mensuel arrondi au centime (comme dans la these IV.3.2)
+  // puis CA annuel = CA mensuel arrondi x 12
+  // C'est ce CA annuel qui sert de base aux redevances et FMD (comme Tableau 15)
+  const revenueMonthly = Math.round(goldRecoveredMonthly * goldPerG * 100) / 100;
   const revenueAnnual = revenueMonthly * 12;
 
   // Etape 1 : Benefice mensuel brut = CA - OPEX
   const cashflowBrut = revenueMonthly - opexMonthly;
 
   // Etape 2 : Flux de tresorerie BRUT annuel apres IS 27,5%
-  // (Benefice mensuel x 12) x 0,725 = Flux brut annuel apres IS
-  // C'est le "FLUX DE TRESORERIE BRUT" du Tableau 15
+  // (Benefice mensuel x 12) x 0,725
   const isMultiplier = 1 - BF.isRate; // 0.725
-  const fluxBrutAnnuelApresIS = cashflowBrut * 12 * isMultiplier;
+  const fluxBrutAnnuelApresIS = Math.round(cashflowBrut * 12 * isMultiplier * 100) / 100;
+  const isAnnuel = cashflowBrut * 12 * BF.isRate;
 
-  // Etape 3 : Deductions sur le CA annuel (redevances, FMD, taxes superficieres)
-  // Ces deductions s'appliquent SUR LE FLUX BRUT APRES IS pour donner le flux NET
-  const redevanceAnnuelle = revenueAnnual * BF.redevanceRate;  // 8% du CA annuel
-  const fmdAnnuel = revenueAnnual * BF.fmdRate;                // 1% du CA annuel
-  const taxeY1 = BF.taxeSuperfY1 * permitAreaKm2;             // Taxes superficieres A1
-  const taxeRenew = BF.taxeSuperfRenew * permitAreaKm2;       // Taxes superficieres A2+
+  // Etape 3 : Deductions sur le CA ANNUEL
+  // Redevance 8% + FMD 1% calcules sur le CA annuel (comme Tableau 15)
+  const redevanceAnnuelle = revenueAnnual * BF.redevanceRate;
+  const fmdAnnuel = revenueAnnual * BF.fmdRate;
+  const taxeY1 = BF.taxeSuperfY1 * permitAreaKm2;
+  const taxeRenew = BF.taxeSuperfRenew * permitAreaKm2;
 
   const totalDeductionsY1 = redevanceAnnuelle + fmdAnnuel + taxeY1;
   const totalDeductionsY2 = redevanceAnnuelle + fmdAnnuel + taxeRenew;
 
-  // Etape 4 : FLUX DE TRESORERIE NET = Flux brut apres IS - Total deductions
-  // C'est ce flux qui entre dans la VAN (comme dans le Tableau 15)
+  // Etape 4 : FLUX NET = Flux brut apres IS - Total deductions
   const cashflowNetY1 = fluxBrutAnnuelApresIS - totalDeductionsY1;
   const cashflowNetY2 = fluxBrutAnnuelApresIS - totalDeductionsY2;
 
+  // VAN : CAPEX en annee 1 (actualise), flux nets en annees 2, 3, 4
+  // Pas d'annee zero dans la these — l'investissement demarre en annee 1
   const cf = [cashflowNetY1, cashflowNetY2, cashflowNetY2];
-  const van = cf.reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 1), -capexTotal);
+  const van = cf.reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 2), 0)
+    - capexTotal / (1 + BF.discountRate);
 
-  // Scenario conservateur (-50% prix or), meme sequence
-  const goldPriceConserv = goldPriceUSD * 0.5;
-  const goldPerGConserv = goldPriceConserv / BF.ozToG;
-  const revenueConserv = goldRecoveredMonthly * goldPerGConserv;
-  const revenueAnnualConserv = revenueConserv * 12;
-  const cashBrutConserv = revenueConserv - opexMonthly;
-  const fluxBrutConservApresIS = cashBrutConserv * 12 * isMultiplier;
+  // Scenario conservateur (-50% prix or), meme sequence exacte
+  const revenueMonthlyConserv = Math.round(goldRecoveredMonthly * (goldPriceUSD * 0.5 / BF.ozToG) * 100) / 100;
+  const revenueAnnualConserv = revenueMonthlyConserv * 12;
+  const cashBrutConserv = revenueMonthlyConserv - opexMonthly;
+  const fluxBrutConservApresIS = Math.round(cashBrutConserv * 12 * isMultiplier * 100) / 100;
   const redevConservAnnuelle = revenueAnnualConserv * BF.redevanceRate;
   const fmdConservAnnuel = revenueAnnualConserv * BF.fmdRate;
   const cfNetConservY1 = fluxBrutConservApresIS - (redevConservAnnuelle + fmdConservAnnuel + taxeY1);
   const cfNetConservY2 = fluxBrutConservApresIS - (redevConservAnnuelle + fmdConservAnnuel + taxeRenew);
-  const vanConserv = [cfNetConservY1, cfNetConservY2, cfNetConservY2].reduce(
-    (acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 1), -capexTotal
-  );
+
+  // Scenario conservateur, meme structure d'actualisation
+  const vanConserv = [cfNetConservY1, cfNetConservY2, cfNetConservY2]
+    .reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 2), 0)
+    - capexTotal / (1 + BF.discountRate);
 
   const paybackMonths = cashflowNetY1 > 0
     ? Math.ceil(capexTotal / cashflowNetY1 * 12)
@@ -123,9 +129,8 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
   return {
     goldPerG, monthlyOre, goldRecoveredMonthly,
     revenueMonthly, revenueAnnual,
-    cashflowBrut,
+    cashflowBrut, isAnnuel,
     fluxBrutAnnuelApresIS,
-    isAnnuel: cashflowBrut * 12 * BF.isRate,
     redevanceAnnuelle, fmdAnnuel,
     taxeY1, taxeRenew,
     totalDeductionsY1, totalDeductionsY2,
