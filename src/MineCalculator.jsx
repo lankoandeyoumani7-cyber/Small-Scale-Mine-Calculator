@@ -27,7 +27,8 @@ const PHASE_DEFS = [
 const emptyPhaseInputs = () => ({
   depositName: "", tonnes: "", grade: "", depth: "", oreType: "oxide",
   capacityTPD: "", recovery: "", permitAreaKm2: "", goldPrice: "",
-  useReservePrice: true, reserveDiscount: null, // null = pas encore calculé/choisi
+  useReservePrice: true, reserveDiscount: null,
+  goldPriceConserv: "", // prix conservateur saisi librement par l'utilisateur
 });
 
 function estimateCapex(capacityTPD, pitDepth) {
@@ -67,15 +68,15 @@ function estimateOpex(capacityTPD, headcountScale) {
   };
 }
 
-function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery, goldPriceUSD, permitAreaKm2 }) {
+function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery, goldPriceUSD, goldPriceConservUSD, permitAreaKm2 }) {
   const goldPerG = goldPriceUSD / BF.ozToG;
   const monthlyOre = capacityTPD * 30;
   const goldRecoveredMonthly = monthlyOre * grade * recovery;
 
-  // CA mensuel arrondi au centime (comme dans la these IV.3.2)
-  // puis CA annuel = CA mensuel arrondi x 12
-  // C'est ce CA annuel qui sert de base aux redevances et FMD (comme Tableau 15)
+  // CA mensuel arrondi au centime
   const revenueMonthly = Math.round(goldRecoveredMonthly * goldPerG * 100) / 100;
+
+  // CA annuel = CA mensuel x 12 (calcul correct)
   const revenueAnnual = revenueMonthly * 12;
 
   // Etape 1 : Benefice mensuel brut = CA - OPEX
@@ -107,8 +108,10 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
   const van = cf.reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 2), 0)
     - capexTotal / (1 + BF.discountRate);
 
-  // Scenario conservateur (-50% prix or), meme sequence exacte
-  const revenueMonthlyConserv = Math.round(goldRecoveredMonthly * (goldPriceUSD * 0.5 / BF.ozToG) * 100) / 100;
+  // Scenario conservateur : prix saisi librement par l'utilisateur
+  // Si non saisi, on utilise 50% du prix de base par defaut
+  const goldConservEffectif = goldPriceConservUSD > 0 ? goldPriceConservUSD : goldPriceUSD * 0.5;
+  const revenueMonthlyConserv = Math.round(goldRecoveredMonthly * (goldConservEffectif / BF.ozToG) * 100) / 100;
   const revenueAnnualConserv = revenueMonthlyConserv * 12;
   const cashBrutConserv = revenueMonthlyConserv - opexMonthly;
   const fluxBrutConservApresIS = Math.round(cashBrutConserv * 12 * isMultiplier * 100) / 100;
@@ -135,6 +138,7 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
     taxeY1, taxeRenew,
     totalDeductionsY1, totalDeductionsY2,
     cashflowNetY1, cashflowNetY2,
+    goldConservEffectif,
     van, vanConserv, paybackMonths,
     costPerTonne: opexMonthly / monthlyOre,
     marginPerTonne: (revenueMonthly - opexMonthly) / monthlyOre,
@@ -184,7 +188,7 @@ function calcSensitivityGrid({ capacityTPD, oreDepth, recovery, permitAreaKm2, c
     const opex = estimateOpex(capacity, 1);
     const grid = grades.map(grade =>
       goldPrices.map(goldPriceUSD => {
-        const fin = calcFinancials({ capexTotal, opexMonthly: opex.total, capacityTPD: capacity, grade, recovery, goldPriceUSD, permitAreaKm2 });
+        const fin = calcFinancials({ capexTotal, opexMonthly: opex.total, capacityTPD: capacity, grade, recovery, goldPriceUSD, goldPriceConservUSD: 0, permitAreaKm2 });
         return fin.van;
       })
     );
@@ -272,7 +276,10 @@ function computePhase(inputs, priorContext) {
   const cog = calcCutoffGrade(effectiveGold);
   const fin = calcFinancials({
     capexTotal: capexTotal + planModificationFeeUSD,
-    opexMonthly: opex.total, capacityTPD, grade, recovery, goldPriceUSD: effectiveGold, permitAreaKm2,
+    opexMonthly: opex.total, capacityTPD, grade, recovery,
+    goldPriceUSD: effectiveGold,
+    goldPriceConservUSD: parseFloat(inputs.goldPriceConserv) * BF.ozToG || 0,
+    permitAreaKm2,
   });
   const sensitivity = calcSensitivityGrid({ capacityTPD, oreDepth: depth, recovery, permitAreaKm2, centerGoldPrice: effectiveGold, centerGrade: grade });
   const durationMonths = capacityTPD > 0 ? Math.ceil(tonnes / (capacityTPD * 30)) : 0;
@@ -553,7 +560,7 @@ async function generatePdfReport({ phases, consolidated }) {
     totalRow("FLUX NET annuel A1", fmtUSD(Math.round(fin.cashflowNetY1)), colors.success);
     totalRow("FLUX NET annuel A2 et A3", fmtUSD(Math.round(fin.cashflowNetY2)), colors.success);
     row(`VAN scenario de base (IS 27,5%)`, fmtK(fin.van));
-    row(`VAN scenario conservateur (-50% prix or)`, fmtK(fin.vanConserv));
+    row(`VAN scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif / BF.ozToG))}/oz, IS 27,5%)`, fmtK(fin.vanConserv));
     if (fin.paybackMonths) row("Periode de remboursement estimee", `${fin.paybackMonths} mois`);
 
     y += 8;
@@ -714,6 +721,29 @@ function PhaseForm({ phaseLabel, inputs, onChange }) {
             );
           })()}
         </div>
+
+        {/* Prix du scenario conservateur */}
+        <div style={{ marginTop: 8, padding: 14, background: C.panel, borderRadius: 8, border: `1.5px solid ${C.border}` }}>
+          <Label>Prix de l'or — Scenario conservateur</Label>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="number"
+              value={inputs.goldPriceConserv}
+              placeholder="Ex : 2250"
+              onChange={e => onChange({ ...inputs, goldPriceConserv: e.target.value })}
+              style={{ flex: 1, padding: "8px 12px", borderRadius: 6, border: `1.5px solid ${C.border}`, background: C.surface, fontSize: 14, color: C.text, outline: "none", fontFamily: "inherit" }}
+            />
+            <span style={{ fontSize: 12, color: C.textMuted, whiteSpace: "nowrap" }}>USD/oz</span>
+          </div>
+          <p style={{ margin: "6px 0 0", fontSize: 11, color: C.textMuted }}>
+            Prix utilise pour tester la robustesse du projet dans un scenario pessimiste. Si laisse vide, l'app utilisera 50% du prix de base.
+          </p>
+          {inputs.goldPriceConserv && parseFloat(inputs.goldPriceConserv) > 0 && parseFloat(inputs.goldPrice) > 0 && (
+            <div style={{ marginTop: 8, fontSize: 11, color: C.goldDark, fontWeight: 700 }}>
+              Decote appliquee : {((1 - parseFloat(inputs.goldPriceConserv) / parseFloat(inputs.goldPrice)) * 100).toFixed(1)}% par rapport au cours spot
+            </div>
+          )}
+        </div>
       </Card>
     </div>
   );
@@ -855,7 +885,7 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
 
       <Card title="Valeur Actuelle Nette - 3 ans (taux 10%)" accent={C.goldDark}>
         <VanBar label={`Scenario base (${fmtUSD(Math.round(effectiveGold))}/oz, IS 27,5%)`} van={fin.van} maxAbs={maxVan} />
-        <VanBar label={`Scenario conservateur (-50% prix or, IS 27,5%)`} van={fin.vanConserv} maxAbs={maxVan} />
+        <VanBar label={`Scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif / BF.ozToG))}/oz, IS 27,5%)`} van={fin.vanConserv} maxAbs={maxVan} />
         {fin.paybackMonths && (
           <div style={{ marginTop: 16, padding: 12, background: C.successBg, borderRadius: 8, textAlign: "center" }}>
             <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 2 }}>Periode de remboursement estimee</div>
