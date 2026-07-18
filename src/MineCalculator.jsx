@@ -108,10 +108,9 @@ function calcFinancials({ capexTotal, opexMonthly, capacityTPD, grade, recovery,
   const van = cf.reduce((acc, c, i) => acc + c / Math.pow(1 + BF.discountRate, i + 2), 0)
     - capexTotal / (1 + BF.discountRate);
 
-  // Scenario conservateur : prix saisi librement par l'utilisateur
-  // Si non saisi, on utilise 50% du prix de base par defaut
-  const goldConservEffectif = goldPriceConservUSD > 0 ? goldPriceConservUSD : goldPriceUSD * 0.5;
-  const revenueMonthlyConserv = Math.round(goldRecoveredMonthly * (goldConservEffectif / BF.ozToG) * 100) / 100;
+  // Scenario conservateur : goldPriceConservUSD est deja en USD/g
+  const goldConservEffectif = goldPriceConservUSD; // USD/g
+  const revenueMonthlyConserv = Math.round(goldRecoveredMonthly * goldConservEffectif * 100) / 100;
   const revenueAnnualConserv = revenueMonthlyConserv * 12;
   const cashBrutConserv = revenueMonthlyConserv - opexMonthly;
   const fluxBrutConservApresIS = Math.round(cashBrutConserv * 12 * isMultiplier * 100) / 100;
@@ -274,11 +273,16 @@ function computePhase(inputs, priorContext) {
   // OPEX toujours recalculé sur la nouvelle capacité totale (decision validee)
   const opex = estimateOpex(capacityTPD, 1);
   const cog = calcCutoffGrade(effectiveGold);
+  const goldSpotUSD = parseFloat(inputs.goldPrice) || 0; // cours spot brut
   const fin = calcFinancials({
     capexTotal: capexTotal + planModificationFeeUSD,
     opexMonthly: opex.total, capacityTPD, grade, recovery,
     goldPriceUSD: effectiveGold,
-    goldPriceConservUSD: parseFloat(inputs.goldPriceConserv) * BF.ozToG || 0,
+    // Prix conservateur en USD/oz converti en USD/g (diviser par ozToG)
+    // Si non saisi, fallback = 50% du cours SPOT (pas du prix de reserve)
+    goldPriceConservUSD: inputs.goldPriceConserv && parseFloat(inputs.goldPriceConserv) > 0
+      ? parseFloat(inputs.goldPriceConserv) / BF.ozToG
+      : (goldSpotUSD * 0.5) / BF.ozToG,
     permitAreaKm2,
   });
   const sensitivity = calcSensitivityGrid({ capacityTPD, oreDepth: depth, recovery, permitAreaKm2, centerGoldPrice: effectiveGold, centerGrade: grade });
@@ -560,7 +564,7 @@ async function generatePdfReport({ phases, consolidated }) {
     totalRow("FLUX NET annuel A1", fmtUSD(Math.round(fin.cashflowNetY1)), colors.success);
     totalRow("FLUX NET annuel A2 et A3", fmtUSD(Math.round(fin.cashflowNetY2)), colors.success);
     row(`VAN scenario de base (IS 27,5%)`, fmtK(fin.van));
-    row(`VAN scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif / BF.ozToG))}/oz, IS 27,5%)`, fmtK(fin.vanConserv));
+    row(`VAN scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif * BF.ozToG))}/oz, IS 27,5%)`, fmtK(fin.vanConserv));
     if (fin.paybackMonths) row("Periode de remboursement estimee", `${fin.paybackMonths} mois`);
 
     y += 8;
@@ -885,7 +889,7 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
 
       <Card title="Valeur Actuelle Nette - 3 ans (taux 10%)" accent={C.goldDark}>
         <VanBar label={`Scenario base (${fmtUSD(Math.round(effectiveGold))}/oz, IS 27,5%)`} van={fin.van} maxAbs={maxVan} />
-        <VanBar label={`Scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif / BF.ozToG))}/oz, IS 27,5%)`} van={fin.vanConserv} maxAbs={maxVan} />
+        <VanBar label={`Scenario conservateur (${fmtUSD(Math.round(fin.goldConservEffectif * BF.ozToG))}/oz, IS 27,5%)`} van={fin.vanConserv} maxAbs={maxVan} />
         {fin.paybackMonths && (
           <div style={{ marginTop: 16, padding: 12, background: C.successBg, borderRadius: 8, textAlign: "center" }}>
             <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 2 }}>Periode de remboursement estimee</div>
