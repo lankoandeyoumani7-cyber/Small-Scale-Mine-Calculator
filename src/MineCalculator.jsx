@@ -48,7 +48,8 @@ function estimateCapex(capacityTPD, pitDepth) {
     tooling: Math.round(750),
     ppe: Math.round(7605 * s),
     permis: Math.round(BF.permisOctroi),
-    nies: 15000,
+    // NIES non estimee : necessite une etude environnementale et sociale specifique
+    // non realisee dans ce travail — a integrer lors de l'etude de faisabilite complete
   };
 }
 
@@ -532,8 +533,8 @@ async function generatePdfReport({ phases, consolidated }) {
       ["Eclairage", capex.lighting], ["Alimentation en eau", capex.water],
       ["Infrastructures", capex.infrastructure], ["Elution / Fonderie", capex.elution],
       ["EPI / Securite", capex.ppe], ["Permis d'exploitation", capex.permis],
-      ["NIES (estimation)", capex.nies],
     ].forEach(([l, v]) => row(l, fmtUSD(v)));
+    paragraph("Note : Notice d'Impact Environnemental et Social (NIES) non estimee — necessite une etude specifique a integrer lors de l'etude de faisabilite complete.", 8, colors.warn);
     totalRow("Sous-total CAPEX materiel", fmtUSD(capexTotal), colors.red);
     if (planModificationFeeUSD > 0) {
       row("Frais de modification du plan d'exploitation (loi)", fmtUSD(Math.round(planModificationFeeUSD)), "10 000 000 FCFA - extension de capacite");
@@ -819,8 +820,10 @@ function PhaseResults({ results, sensCapacityIdx, setSensCapacityIdx }) {
           ["Eclairage", capex.lighting], ["Alimentation en eau", capex.water],
           ["Infrastructures (base vie, routes)", capex.infrastructure], ["Elution / Fonderie", capex.elution],
           ["EPI / Securite", capex.ppe], ["Permis d'exploitation (octroi)", capex.permis],
-          ["NIES (estimation)", capex.nies],
         ].map(([l, v]) => <MetricRow key={l} label={l} value={fmtUSD(v)} />)}
+        <div style={{ margin: "10px 0 4px", padding: 10, background: C.warnBg, borderRadius: 8, fontSize: 11, color: C.warn }}>
+          ⚠ Notice d'Impact Environnemental et Social (NIES) : coût non estimé dans ce modèle — nécessite une étude spécifique à intégrer lors de l'étude de faisabilité complète.
+        </div>
         <MetricRow label="Sous-total CAPEX materiel" value={fmtUSD(capexTotal)} highlight={C.red} />
         {planModificationFeeUSD > 0 && (
           <MetricRow
